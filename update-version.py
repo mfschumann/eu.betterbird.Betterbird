@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -8,6 +9,7 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+from urllib.request import urlopen
 
 try:
     import yaml
@@ -49,6 +51,8 @@ def parse_args():
     parser.add_argument("commit", nargs="?", help="Betterbird commit hash (required if version is major version only)")
     parser.add_argument("-f", "--force", action="store_true", help="Skip version check from appdata.xml")
     parser.add_argument("-p", "--private-mirror", action="store_true", help="Replace upstream mirror with private mirror")
+    parser.add_argument("--self-contained", action="store_true",
+                        help="Download source and XPI files directly to compute SHA256 hashes (skip SHA256SUMS file)")
     return parser.parse_args()
 
 
@@ -80,14 +84,34 @@ def get_appdata_version():
     return None
 
 
-def get_base_url():
-    """Extract base URL for sources from appdata.xml."""
+def get_appdata_source_location():
+    """Extract the full source artifact location URL from appdata.xml."""
     content = Path(APPDATA_FILE).read_text()
     match = re.search(r'<artifact type="source">\s*<location>([^<]+)</location>', content, re.DOTALL)
     if match:
-        source_archive = match.group(1)
-        return source_archive.rsplit("/source/", 1)[0]
+        return match.group(1)
     return None
+
+
+def get_base_url():
+    """Extract base URL for sources from appdata.xml."""
+    source_archive = get_appdata_source_location()
+    if source_archive:
+        # Remove the "/source/..." suffix to get base URL
+        return re.sub(r'/source/.*$', '', source_archive)
+    return None
+
+
+def compute_sha256(url):
+    """Compute SHA256 hash of a file given its URL."""
+    h = hashlib.sha256()
+    with urlopen(url) as response:
+        while True:
+            chunk = response.read(8192)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def update_sources_file(base_url, betterbird_version):
@@ -210,6 +234,51 @@ def handle_private_mirror(betterbird_version):
         f.write(new_content)
 
 
+def self_contained_update_sources(base_url, betterbird_version):
+    """Generate thunderbird-sources.json by downloading files and computing SHA256 hashes."""
+    entries = []
+    # Get source archive URL from appdata.xml
+    source_url = get_appdata_source_location()
+    if not source_url:
+        raise ValueError("Could not extract source archive location from appdata.xml")
+    source_archive_entry = {
+        "type": "archive",
+        "url": source_url,
+        "sha256": compute_sha256(source_url)
+    }
+
+    # Determine which locales have patcher scripts
+    major_version = betterbird_version.split(".")[0]
+    scripts_dir = Path(f"thunderbird-patches/{major_version}/scripts")
+    if scripts_dir.is_dir():
+        for script_file in scripts_dir.iterdir():
+            if script_file.suffix == ".sh":
+                locale = script_file.stem
+                xpi_url = f"{base_url}/{PLATFORM}/xpi/{locale}.xpi"
+                try:
+                    sha256 = compute_sha256(xpi_url)
+                    entries.append({
+                        "type": "file",
+                        "url": xpi_url,
+                        "sha256": sha256,
+                        "dest": "langpacks/",
+                        "dest-filename": f"langpack-{locale}@{PACKAGE}.mozilla.org.xpi"
+                    })
+                except Exception as exc:
+                    print(f"Warning: Could not download or hash {xpi_url}: {exc}", file=sys.stderr)
+
+    if source_archive_entry is None:
+        raise ValueError("Source archive entry not found")
+
+    # Write JSON array with source archive last
+    with open(SOURCES_FILE, "w") as f:
+        f.write("[\n")
+        for entry in entries:
+            f.write(f"    {json.dumps(entry, indent=8)[8:]},\n")
+        f.write(f"    {json.dumps(source_archive_entry, indent=8)[8:]}\n")
+        f.write("]\n")
+
+
 def main():
     args = parse_args()
     
@@ -258,7 +327,10 @@ def main():
         sys.exit(1)
     
     # Update sources file
-    update_sources_file(base_url, betterbird_version)
+    if args.self_contained:
+        self_contained_update_sources(base_url, betterbird_version)
+    else:
+        update_sources_file(base_url, betterbird_version)
     
     # Update manifest
     update_manifest(betterbird_commit, source_spec, betterbird_version)
