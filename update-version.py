@@ -9,6 +9,11 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
 # Configuration
 BETTERBIRD_REPO = "https://github.com/Betterbird/thunderbird-patches"
 PACKAGE = "thunderbird"
@@ -135,20 +140,28 @@ def update_sources_file(base_url, betterbird_version):
 
 
 def update_manifest(betterbird_commit, source_spec, betterbird_version):
-    """Update manifest YAML using yq."""
-    # Update commit
-    run_cmd(
-        f'yq -i \'(.modules[] | select(.name=="betterbird") | .sources[] | select(.dest=="thunderbird-patches") | .commit) = "{betterbird_commit}"\' {MANIFEST_FILE}'
-    )
+    """Update manifest YAML using PyYAML."""
+    if yaml is None:
+        raise ImportError("PyYAML is required for update_manifest. Install with: pip install pyyaml")
     
-    if source_spec == "tag":
-        run_cmd(
-            f'yq -i \'(.modules[] | select(.name=="betterbird") | .sources[] | select(.dest=="thunderbird-patches") | .tag) = "{betterbird_version}"\' {MANIFEST_FILE}'
-        )
-    else:
-        run_cmd(
-            f'yq -i \'del((.modules[] | select(.name=="betterbird") | .sources[] | select(.dest=="thunderbird-patches") | .tag))\' {MANIFEST_FILE}'
-        )
+    with open(MANIFEST_FILE, "r") as f:
+        manifest = yaml.safe_load(f)
+    
+    # Find the betterbird module
+    for module in manifest.get("modules", []):
+        if module.get("name") == "betterbird":
+            for source in module.get("sources", []):
+                if source.get("dest") == "thunderbird-patches":
+                    source["commit"] = betterbird_commit
+                    if source_spec == "tag":
+                        source["tag"] = betterbird_version
+                    else:
+                        source.pop("tag", None)
+                    break
+            break
+    
+    with open(MANIFEST_FILE, "w") as f:
+        yaml.dump(manifest, f, default_flow_style=False, sort_keys=False)
 
 
 def update_distribution_ini(betterbird_commit):
